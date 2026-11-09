@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Ninja 网络自愈",
+    "description": "访问 GitHub 等外网站点失败时，自动启动 NinjaDesktop、开启系统代理与 TUN，然后重试原请求。"
+  }
+}

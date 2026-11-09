@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Ninja network self-heal",
+    "description": "Starts NinjaDesktop and enables its system proxy and TUN when an external site such as github.com is unreachable, then retries the request."
+  }
+}

@@ -1,0 +1,15 @@
+# Loader patch: inserts this bundle's single Host plugin row.
+# Tune the values below, then reinstall the bundle (or edit the row in the
+# profile's cordis.patch.yml) — the user's own patch layer survives upgrades.
+- insert:
+    - id: dsh-ninja-net-heal
+      name: dsh-ninja-net-heal
+      config:
+        exePath: C:\Program Files\NinjaDesktop\NinjaDesktop.exe
+        controllerPort: 9799
+        proxyPort: 7897
+        probeUrl: https://github.com
+        probeTimeoutMs: 8000
+        launchTimeoutMs: 45000
+        autoHeal: true
+        healCooldownMs: 60000
