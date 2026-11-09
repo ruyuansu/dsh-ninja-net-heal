@@ -11,6 +11,6 @@
         proxyPort: 7897
         manageOnWebAccess: true
         idleGraceMs: 15000
-        releaseMode: disable
+        releaseMode: restore
         probeUrl: https://github.com
         autoHeal: true

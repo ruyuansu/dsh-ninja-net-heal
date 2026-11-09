@@ -2,18 +2,18 @@
 
 DeepSeek Harness（DSH）插件：**访问网页时自动开代理/TUN，访问结束自动关掉**。
 
-规则：需要访问外部网站时，自动开启 `NinjaDesktop` 的**系统代理**与 **TUN**；网页访问结束后自动关闭，避免代理长期常驻。如果网页仍然失败，`net_self_heal` 会做一次修复并把每一步的真实结果报出来。
+规则：需要访问外部网站时，自动开启 `NinjaDesktop` 的**系统代理**与 **TUN**；访问结束后恢复到访问前的状态，避免代理长期常驻。如果网页仍然失败，`net_self_heal` 会做一次修复并把每一步的真实结果报出来。
 
 ## 行为
 
 | 时机 | 动作 |
 | --- | --- |
 | web 工具执行前（`web_fetch` / `web_search` / `read_page`） | 开启系统代理 + TUN，然后才真正发起请求 |
-| 最后一次 web 调用结束 + 空闲 `idleGraceMs` | 关闭系统代理 + TUN |
+| 最后一次 web 调用结束 + 空闲 `idleGraceMs` | 按 `releaseMode` 处理：默认恢复到访问前状态 |
 | 回合结束（`turn/end`） | 立即关闭，并清理可能残留的租约 |
 | web 调用失败 | 后台 `net_self_heal` 再修一次 |
 
-连续多个 web 调用不会反复开关：用**租约计数**合并，只有全部结束后才关。关闭默认是「强制关闭」（`releaseMode: disable`），也可设为 `restore`，在访问前本来就是开的情况下保持开启。
+连续多个 web 调用不会反复开关：用**租约计数**合并，只有全部结束后才处理。默认 `releaseMode: restore`——**恢复到访问前的状态**：原来关着就在结束后关掉，原来你自己开着就保持开启、不干扰。想强制每轮结束后都关闭，改成 `releaseMode: disable`。
 
 ## 关键修复：系统代理「打不开」
 
@@ -53,7 +53,7 @@ v2 改走程序自己的接口，这些才是权威入口：
         proxyPort: 7897
         manageOnWebAccess: true
         idleGraceMs: 15000
-        releaseMode: disable
+        releaseMode: restore
         probeUrl: https://github.com
         autoHeal: true
 ```
@@ -66,7 +66,7 @@ v2 改走程序自己的接口，这些才是权威入口：
 | `proxyPort` | `7897` | 混合代理端口 |
 | `manageOnWebAccess` | `true` | 总开关：是否在网页访问前后自动开关 |
 | `idleGraceMs` | `15000` | 最后一次 web 调用后多久关闭 |
-| `releaseMode` | `disable` | `disable` 结束即关；`restore` 恢复到访问前状态 |
+| `releaseMode` | `restore` | `restore` 恢复到访问前状态；`disable` 每轮结束无条件关闭 |
 | `probeUrl` | `https://github.com` | 默认探测目标 |
 | `autoHeal` | `true` | web 调用失败后是否后台修复 |
 | `launchTimeoutMs` | `45000` | 启动后等待后端就绪 |
@@ -110,7 +110,7 @@ node test/lifecycle.mjs
 - 仅 Windows：依赖程序后端、注册表、WinINet、`tasklist`、PowerShell 5.1。
 - 程序必须能提供 `9190` 后端；内核被手动停掉时需要先启动程序。
 - 频繁开关 TUN 有约 1–3 秒建立时间，所以用 `idleGraceMs` 合并连续访问；把该值调大可以减少抖动，代价是代理多留一会儿。
-- `releaseMode: disable` 会关掉你手动开的代理/TUN；不想被关就用 `restore`。
+- `releaseMode: restore`（默认）只在你原本关着时才关闭，不会动你手动开启的代理/TUN；`disable` 则会无条件关闭。
 - 节点失效、订阅过期等需要你在 NinjaDesktop 里处理，插件不替你换节点。
 
 ## 许可证

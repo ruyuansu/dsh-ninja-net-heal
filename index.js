@@ -497,8 +497,8 @@ export async function heal(config, options = {}) {
 /* ------------------------------------------------------------ plugin entry */
 
 const PROMPT_TEXT = [
-  '网络规则：访问网页前，插件会自动开启 NinjaDesktop 的系统代理与 TUN，网页访问结束后自动关闭；',
-  '这是正常现象，不要为此提示用户或手动改设置。',
+  '网络规则：访问网页前，插件会自动开启 NinjaDesktop 的系统代理与 TUN，访问结束后恢复到访问前的状态',
+  '（原来关着就关闭，原来开着就保持开启）；这是正常现象，不要为此提示用户或手动改设置。',
   '如果网页仍然失败，调用 net_self_heal 并传入失败的 URL 做一次修复；',
   '只有在 net_self_heal 返回 healed: false 之后，才改用其他办法（检查 DNS、换镜像源、换备用站点等），',
   '并如实说明哪一步失败，不要假装访问成功。',
@@ -539,16 +539,23 @@ export async function apply(ctx, config) {
       state.baseline = null
       return { ok: true, steps: [{ step: 'cached', ok: true, detail: '代理与 TUN 本来就关着' }] }
     }
-    const steps = []
     const baseline = state.baseline
-    const target = cfg.releaseMode === 'restore' && baseline && baseline.available ? baseline : null
-    const restoreTo = Boolean(target && (target.proxy || target.tun))
-    const result = await runExclusive(async () => {
-      if (restoreTo) return switchOn(cfg, steps)
-      return switchOff(cfg, steps)
-    })
-    if (result.ok) state.on = restoreTo
     state.baseline = null
+    // restore: the switches were already on before this window, so leave them
+    // exactly as they are instead of forcing either state. state.on drops to
+    // false so the next window captures a fresh baseline (which may be off by
+    // then, e.g. because the user switched it off meanwhile).
+    const wasOnBefore = cfg.releaseMode === 'restore' && baseline && baseline.available && (baseline.proxy || baseline.tun)
+    if (wasOnBefore) {
+      state.on = false
+      const report = { ok: true, steps: [{ step: 'restore', ok: true, detail: '访问前即为开启，保持原样' }] }
+      state.lastReport = report
+      log('restore: 保持原状（访问前即为开启）')
+      return report
+    }
+    const steps = []
+    const result = await runExclusive(() => switchOff(cfg, steps))
+    state.on = result.ok ? false : true
     state.lastReport = result
     log(`已关闭代理与 TUN: ${result.ok}`)
     return result
@@ -648,6 +655,8 @@ export async function apply(ctx, config) {
       isConcurrencySafe: () => false,
       execute: async (args) => {
         const url = args && typeof args.url === 'string' && args.url.trim() ? args.url.trim() : cfg.probeUrl
+        // Capture the pre-repair state so releaseMode 'restore' can honour it.
+        if (!state.baseline) state.baseline = await snapshot(cfg)
         const report = await heal(cfg, { url })
         // heal() switched access on outside a lease; hold one so the idle
         // timer turns it back off instead of leaving it on forever.
