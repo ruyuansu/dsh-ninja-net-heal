@@ -1,19 +1,18 @@
 /**
- * dsh-ninja-net-heal — repair broken external web access.
+ * dsh-ninja-net-heal — automatic proxy/TUN window around web access.
  *
- * Rule implemented by this plugin:
- *   When a web request fails (for example github.com is unreachable), start
- *   NinjaDesktop, enable its system proxy and TUN mode, then retry the
- *   original URL; only then look for other workarounds.
+ * Behaviour (per user request):
+ *   Before a web tool runs, turn the NinjaDesktop system proxy and TUN ON.
+ *   After web access finishes, turn them back OFF.
  *
- * The plugin is Host-only: it registers one tool for the model, a short
- * system-prompt section stating the rule, and an automatic repair that runs
- * after a failed web tool call.
- *
- * Control surface: NinjaDesktop bundles a mihomo kernel. Its external
- * controller (127.0.0.1:9799 by default) exposes GET/PATCH /configs, which is
- * how TUN is switched. The system proxy is the WinINet registry setting that
- * the application's own toggle writes.
+ * Why the application's own API is used
+ *   NinjaDesktop owns both switches. Writing the WinINet registry key or the
+ *   mihomo tun flag directly is not enough: the application keeps its own
+ *   state and re-asserts it, which made the system proxy appear "stuck off".
+ *   The authoritative calls are:
+ *     POST /api/sysproxy/enable | disable | GET /api/sysproxy/status
+ *     PUT  /api/config   { system_proxy: true|false, tun_mode: true|false }
+ *   The registry write is kept only as a verified fallback.
  */
 
 import { spawn } from 'node:child_process'
@@ -25,27 +24,36 @@ import path from 'node:path'
 import tls from 'node:tls'
 
 const PLUGIN_ID = 'dsh-ninja-net-heal'
-const USER_AGENT = `${PLUGIN_ID}/1.0`
+const USER_AGENT = `${PLUGIN_ID}/2.0`
 const WEB_TOOLS = new Set(['web_fetch', 'web_search', 'read_page', 'fetch'])
 
 const DEFAULT_CONFIG = {
-  /** NinjaDesktop executable, launched when the kernel is not reachable. */
+  /** NinjaDesktop executable, launched when its backend is not reachable. */
   exePath: 'C:\\Program Files\\NinjaDesktop\\NinjaDesktop.exe',
   /** Directory holding NinjaDesktop's kernel_session.json / appconfig.yaml. */
   dataDir: '',
-  /** mihomo external controller port. */
+  /** Application backend (web server + privileged helper). */
+  appBaseUrl: 'http://127.0.0.1:9190',
+  /** mihomo external controller port, used to read the real TUN state. */
   controllerPort: 9799,
-  /** Mixed proxy port used for the system proxy setting and the proxy probe. */
+  /** Mixed proxy port (system proxy target, proxy probe target). */
   proxyPort: 7897,
-  /** URL used when the caller gives none. */
+  /** Turn proxy + TUN on before web tools and off after them. */
+  manageOnWebAccess: true,
+  /** Keep them on this long after the last web call, to avoid flapping. */
+  idleGraceMs: 15000,
+  /** 'disable' always ends off; 'restore' returns to the state from before. */
+  releaseMode: 'disable',
+  /** URL used when a caller gives none. */
   probeUrl: 'https://github.com',
   probeTimeoutMs: 8000,
-  /** How long to wait for the controller after launching the application. */
+  /** How long to wait for the backend after launching the application. */
   launchTimeoutMs: 45000,
-  /** Try to repair automatically after a failed web tool call. */
+  /** Verification polling after a switch. */
+  verifyAttempts: 8,
+  verifyDelayMs: 500,
+  /** Probe a failed web call and repair it in the background. */
   autoHeal: true,
-  /** Minimum gap between two automatic repairs. */
-  healCooldownMs: 60000,
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -57,17 +65,214 @@ function localAppData() {
 export function resolveConfig(config) {
   const merged = { ...DEFAULT_CONFIG, ...(config && typeof config === 'object' ? config : {}) }
   if (!merged.dataDir) merged.dataDir = path.join(localAppData(), 'NinjaDesktop')
-  merged.controllerPort = Number(merged.controllerPort) || DEFAULT_CONFIG.controllerPort
-  merged.proxyPort = Number(merged.proxyPort) || DEFAULT_CONFIG.proxyPort
-  merged.probeTimeoutMs = Number(merged.probeTimeoutMs) || DEFAULT_CONFIG.probeTimeoutMs
-  merged.launchTimeoutMs = Number(merged.launchTimeoutMs) || DEFAULT_CONFIG.launchTimeoutMs
-  merged.healCooldownMs = Number(merged.healCooldownMs) || DEFAULT_CONFIG.healCooldownMs
+  for (const key of ['controllerPort', 'proxyPort', 'probeTimeoutMs', 'launchTimeoutMs', 'verifyAttempts', 'verifyDelayMs', 'idleGraceMs']) {
+    merged[key] = Number(merged[key]) || DEFAULT_CONFIG[key]
+  }
+  merged.appBaseUrl = String(merged.appBaseUrl || DEFAULT_CONFIG.appBaseUrl).replace(/\/+$/, '')
   return merged
 }
 
-/* ------------------------------------------------------------------ probes */
+/* --------------------------------------------------------------- transports */
 
-function requestOnce(url, timeoutMs) {
+function httpJson({ baseUrl, port, host = '127.0.0.1', method = 'GET', route, body, timeout = 8000, headers = {} }) {
+  return new Promise((resolve) => {
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body))
+    const requestHeaders = { ...headers }
+    if (payload) {
+      requestHeaders['Content-Type'] = 'application/json'
+      requestHeaders['Content-Length'] = String(payload.length)
+    }
+    let options
+    if (baseUrl) {
+      const url = new URL(baseUrl)
+      options = { hostname: url.hostname, port: url.port || 80, method, path: route, headers: requestHeaders, timeout }
+    } else {
+      options = { hostname: host, port, method, path: route, headers: requestHeaders, timeout }
+    }
+    const request = http.request(options, (response) => {
+      const chunks = []
+      response.on('data', (chunk) => chunks.push(chunk))
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        let json = null
+        try {
+          json = text ? JSON.parse(text) : null
+        } catch {
+          json = null
+        }
+        const status = response.statusCode || 0
+        resolve({ ok: status >= 200 && status < 300, status, json, text })
+      })
+    })
+    request.on('timeout', () => request.destroy(new Error('timeout')))
+    request.on('error', (error) => resolve({ ok: false, status: 0, error: error.code || error.message }))
+    if (payload) request.write(payload)
+    request.end()
+  })
+}
+
+/* ------------------------------------------------------ application backend */
+
+export function readController(dataDir) {
+  try {
+    const session = JSON.parse(fs.readFileSync(path.join(dataDir, 'kernel_session.json'), 'utf8'))
+    if (session && session.secret) return { secret: String(session.secret), addr: session.controller_addr || '' }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const bootstrap = fs.readFileSync(path.join(dataDir, 'bootstrap.yaml'), 'utf8')
+    const match = /^\s*secret:\s*(\S+)\s*$/m.exec(bootstrap)
+    if (match) return { secret: match[1], addr: '' }
+  } catch {
+    /* no secret on disk */
+  }
+  return { secret: '', addr: '' }
+}
+
+export async function sysProxyStatus(config) {
+  const response = await httpJson({ baseUrl: config.appBaseUrl, route: '/api/sysproxy/status', timeout: 5000 })
+  const enabled = Boolean(response.ok && response.json && response.json.enabled === true)
+  return { ok: response.ok, enabled, json: response.json, error: response.error, status: response.status }
+}
+
+export async function readAppConfig(config) {
+  return httpJson({ baseUrl: config.appBaseUrl, route: '/api/config', timeout: 6000 })
+}
+
+/** Merge-and-write: the endpoint expects a full config object. */
+export async function writeAppConfig(config, patch) {
+  const current = await readAppConfig(config)
+  if (!current.ok || !current.json) return { ok: false, error: current.error || `HTTP ${current.status}` }
+  const next = { ...current.json, ...patch }
+  const written = await httpJson({ baseUrl: config.appBaseUrl, method: 'PUT', route: '/api/config', body: next, timeout: 25000 })
+  return { ok: written.ok, error: written.error || (written.ok ? undefined : `HTTP ${written.status}`), json: written.json }
+}
+
+export async function setSysProxy(config, enable) {
+  const route = enable ? '/api/sysproxy/enable' : '/api/sysproxy/disable'
+  const response = await httpJson({ baseUrl: config.appBaseUrl, method: 'POST', route, timeout: 25000 })
+  return { ok: response.ok, error: response.error || (response.ok ? undefined : `HTTP ${response.status}`), json: response.json }
+}
+
+export async function kernelTunEnabled(config, secret) {
+  const response = await httpJson({
+    port: config.controllerPort,
+    route: '/configs',
+    timeout: 5000,
+    headers: secret ? { Authorization: `Bearer ${secret}` } : {},
+  })
+  if (!response.ok || !response.json || !response.json.tun) return null
+  return response.json.tun.enable === true
+}
+
+function isAppRunning() {
+  return new Promise((resolve) => {
+    const child = spawn('tasklist', ['/FI', 'IMAGENAME eq NinjaDesktop.exe', '/NH'], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    let out = ''
+    child.stdout.on('data', (chunk) => {
+      out += String(chunk)
+    })
+    child.on('close', () => resolve(/ninjadesktop\.exe/i.test(out)))
+    child.on('error', () => resolve(false))
+  })
+}
+
+export function launchApp(exePath) {
+  if (!fs.existsSync(exePath)) return { ok: false, detail: `可执行文件不存在：${exePath}` }
+  try {
+    const child = spawn(exePath, [], { detached: true, stdio: 'ignore', windowsHide: false })
+    child.on('error', () => {})
+    child.unref()
+    return { ok: true, detail: `已启动 ${exePath}` }
+  } catch (error) {
+    return { ok: false, detail: `启动失败：${error.message || error}` }
+  }
+}
+
+async function waitForBackend(config, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const status = await sysProxyStatus(config)
+    if (status.ok) return true
+    await sleep(800)
+  }
+  return false
+}
+
+/* ------------------------------------------------- registry fallback (rare) */
+
+function runPowerShell(script, timeoutMs = 20000) {
+  const shell = process.env.SystemRoot
+    ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    : 'powershell.exe'
+  return new Promise((resolve) => {
+    const child = spawn(shell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk)
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk)
+    })
+    const timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {
+        /* gone */
+      }
+    }, timeoutMs)
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() })
+    })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      resolve({ code: -1, stdout: '', stderr: error.message || String(error) })
+    })
+  })
+}
+
+/**
+ * Last-resort WinINet write. Only used when the application's own endpoint
+ * reports success but the registry still shows the proxy off.
+ */
+export async function registryProxy(config, enable) {
+  const server = `http=127.0.0.1:${config.proxyPort};https=127.0.0.1:${config.proxyPort};socks=127.0.0.1:${config.proxyPort}`
+  const script = `
+$ErrorActionPreference = 'Stop'
+$key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
+Set-ItemProperty -Path $key -Name ProxyEnable -Value ${enable ? 1 : 0} -Type DWord
+Set-ItemProperty -Path $key -Name ProxyServer -Value '${server}' -Type String
+Add-Type -Namespace NinjaSelfHeal -Name WinINet -MemberDefinition '[DllImport("wininet.dll", SetLastError=true)] public static extern bool InternetSetOption(IntPtr h, int option, IntPtr buffer, int length);'
+[NinjaSelfHeal.WinINet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+[NinjaSelfHeal.WinINet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+$after = Get-ItemProperty -Path $key
+Write-Output ('[state]' + (ConvertTo-Json -Compress -InputObject @{ enable = $after.ProxyEnable }))
+`.trim()
+  const result = await runPowerShell(script)
+  const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith('[state]'))
+  let enableValue = null
+  if (line) {
+    try {
+      enableValue = Number(JSON.parse(line.slice('[state]'.length)).enable)
+    } catch {
+      enableValue = null
+    }
+  }
+  return { ok: result.code === 0 && enableValue === (enable ? 1 : 0), detail: result.stderr || `registry enable=${enableValue}` }
+}
+
+/* ------------------------------------------------------------ probe helpers */
+
+export function probeDirect(url, timeoutMs = 8000) {
   const started = Date.now()
   return new Promise((resolve) => {
     let target
@@ -94,19 +299,11 @@ function requestOnce(url, timeoutMs) {
       },
     )
     request.on('timeout', () => request.destroy(new Error('timeout')))
-    request.on('error', (error) => {
-      resolve({ ok: false, status: 0, error: error.code || error.message, ms: Date.now() - started })
-    })
+    request.on('error', (error) => resolve({ ok: false, status: 0, error: error.code || error.message, ms: Date.now() - started }))
     request.end()
   })
 }
 
-/** Direct fetch, bypassing the system proxy (Node ignores WinINet settings). */
-export function probeDirect(url, timeoutMs = 8000) {
-  return requestOnce(url, timeoutMs)
-}
-
-/** HTTPS through the local mixed proxy, i.e. the path a browser uses. */
 export function probeViaProxy(url, proxyPort = 7897, timeoutMs = 8000) {
   const started = Date.now()
   return new Promise((resolve) => {
@@ -131,21 +328,14 @@ export function probeViaProxy(url, proxyPort = 7897, timeoutMs = 8000) {
       timeout: timeoutMs,
       headers: { Host: authority },
     })
-    const fail = (error, status = 0) =>
-      resolve({ ok: false, status, error, ms: Date.now() - started })
-
+    const fail = (error, status = 0) => resolve({ ok: false, status, error, ms: Date.now() - started })
     connect.on('connect', (response, socket) => {
       if (response.statusCode !== 200) {
         socket.destroy()
         fail(`proxy connect ${response.statusCode}`, response.statusCode)
         return
       }
-      const secure = tls.connect({
-        socket,
-        servername: target.hostname,
-        ALPNProtocols: ['http/1.1'],
-        timeout: timeoutMs,
-      })
+      const secure = tls.connect({ socket, servername: target.hostname, ALPNProtocols: ['http/1.1'], timeout: timeoutMs })
       secure.on('error', (error) => fail(error.code || error.message))
       secure.on('timeout', () => secure.destroy(new Error('timeout')))
       secure.on('secureConnect', () => {
@@ -174,250 +364,97 @@ export function probeViaProxy(url, proxyPort = 7897, timeoutMs = 8000) {
   })
 }
 
-/* -------------------------------------------------------------- controller */
+/* ---------------------------------------------------------------- switching */
 
-export function readController(dataDir) {
-  try {
-    const session = JSON.parse(fs.readFileSync(path.join(dataDir, 'kernel_session.json'), 'utf8'))
-    if (session && session.secret) {
-      return { secret: String(session.secret), addr: session.controller_addr || '' }
+async function verify(config, expect) {
+  const { secret } = readController(config.dataDir)
+  let last = { proxy: null, tun: null }
+  for (let attempt = 1; attempt <= config.verifyAttempts; attempt += 1) {
+    const status = await sysProxyStatus(config)
+    const tun = await kernelTunEnabled(config, secret)
+    last = { proxy: status.enabled, tun, rawProxy: status }
+    if (status.enabled === expect && tun === expect) return { ok: true, attempts: attempt, ...last }
+    await sleep(config.verifyDelayMs)
+  }
+  return { ok: false, attempts: config.verifyAttempts, ...last }
+}
+
+async function switchOn(config, steps) {
+  let backend = await sysProxyStatus(config)
+  if (!backend.ok) {
+    const running = await isAppRunning()
+    if (!running) {
+      const launched = launchApp(config.exePath)
+      steps.push({ step: 'launch', ok: launched.ok, detail: launched.detail })
     }
-  } catch {
-    /* fall through to bootstrap.yaml */
+    const ready = await waitForBackend(config, config.launchTimeoutMs)
+    steps.push({ step: 'backend', ok: ready, detail: ready ? 'NinjaDesktop 后端已就绪' : '等待后端超时' })
+    if (!ready) return { ok: false, steps }
   }
-  try {
-    const bootstrap = fs.readFileSync(path.join(dataDir, 'bootstrap.yaml'), 'utf8')
-    const match = /^\s*secret:\s*(\S+)\s*$/m.exec(bootstrap)
-    if (match) return { secret: match[1], addr: '' }
-  } catch {
-    /* no controller secret on disk */
+
+  const configWrite = await writeAppConfig(config, { system_proxy: true, tun_mode: true })
+  steps.push({ step: 'config', ok: configWrite.ok, detail: configWrite.ok ? 'tun_mode/system_proxy = true' : `写配置失败：${configWrite.error}` })
+
+  const proxyToggle = await setSysProxy(config, true)
+  steps.push({ step: 'sysproxy', ok: proxyToggle.ok, detail: proxyToggle.ok ? '已请求开启系统代理' : `开启失败：${proxyToggle.error}` })
+
+  let result = await verify(config, true)
+  if (!result.ok && result.proxy === false) {
+    const fallback = await registryProxy(config, true)
+    steps.push({ step: 'sysproxy-fallback', ok: fallback.ok, detail: `应用接口未生效，改用注册表直写：${fallback.detail}` })
+    result = await verify(config, true)
   }
-  return { secret: '', addr: '' }
+  steps.push({ step: 'verify-on', ok: result.ok, detail: `proxy=${result.proxy} tun=${result.tun}` })
+  return { ok: result.ok, steps }
 }
 
-export function controllerCall(config, secret, { method = 'GET', path: route = '/configs', body } = {}) {
-  return new Promise((resolve) => {
-    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body))
-    const headers = {}
-    if (secret) headers.Authorization = `Bearer ${secret}`
-    if (payload) {
-      headers['Content-Type'] = 'application/json'
-      headers['Content-Length'] = String(payload.length)
-    }
-    const request = http.request(
-      { host: '127.0.0.1', port: config.controllerPort, method, path: route, headers, timeout: 8000 },
-      (response) => {
-        const chunks = []
-        response.on('data', (chunk) => chunks.push(chunk))
-        response.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8')
-          let json = null
-          try {
-            json = text ? JSON.parse(text) : null
-          } catch {
-            json = null
-          }
-          const ok = (response.statusCode || 0) >= 200 && (response.statusCode || 0) < 300
-          resolve({ ok, status: response.statusCode || 0, json, text })
-        })
-      },
-    )
-    request.on('timeout', () => request.destroy(new Error('timeout')))
-    request.on('error', (error) => resolve({ ok: false, status: 0, error: error.code || error.message }))
-    if (payload) request.write(payload)
-    request.end()
-  })
+async function switchOff(config, steps) {
+  const backend = await sysProxyStatus(config)
+  if (!backend.ok) {
+    steps.push({ step: 'backend', ok: false, detail: 'NinjaDesktop 后端不可用，跳过关闭' })
+    return { ok: false, steps }
+  }
+  const configWrite = await writeAppConfig(config, { system_proxy: false, tun_mode: false })
+  steps.push({ step: 'config', ok: configWrite.ok, detail: configWrite.ok ? 'tun_mode/system_proxy = false' : `写配置失败：${configWrite.error}` })
+
+  const proxyToggle = await setSysProxy(config, false)
+  steps.push({ step: 'sysproxy', ok: proxyToggle.ok, detail: proxyToggle.ok ? '已请求关闭系统代理' : `关闭失败：${proxyToggle.error}` })
+
+  let result = await verify(config, false)
+  if (!result.ok && result.proxy === true) {
+    const fallback = await registryProxy(config, false)
+    steps.push({ step: 'sysproxy-fallback', ok: fallback.ok, detail: `应用接口未生效，改用注册表直写：${fallback.detail}` })
+    result = await verify(config, false)
+  }
+  steps.push({ step: 'verify-off', ok: result.ok, detail: `proxy=${result.proxy} tun=${result.tun}` })
+  return { ok: result.ok, steps }
 }
 
-/* ------------------------------------------------------------ repair steps */
-
-function isAppRunning() {
-  return new Promise((resolve) => {
-    const child = spawn('tasklist', ['/FI', 'IMAGENAME eq NinjaDesktop.exe', '/NH'], {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    let out = ''
-    child.stdout.on('data', (chunk) => {
-      out += String(chunk)
-    })
-    child.on('close', () => resolve(/ninjadesktop\.exe/i.test(out)))
-    child.on('error', () => resolve(false))
-  })
+/** Current state, used by releaseMode 'restore'. */
+export async function snapshot(config) {
+  const status = await sysProxyStatus(config)
+  const { secret } = readController(config.dataDir)
+  const tun = await kernelTunEnabled(config, secret)
+  return { proxy: status.enabled === true, tun: tun === true, available: status.ok }
 }
 
-export function launchApp(exePath) {
-  if (!fs.existsSync(exePath)) {
-    return { ok: false, detail: `可执行文件不存在：${exePath}` }
-  }
-  try {
-    const child = spawn(exePath, [], { detached: true, stdio: 'ignore', windowsHide: false })
-    child.on('error', () => {})
-    child.unref()
-    return { ok: true, detail: `已启动 ${exePath}` }
-  } catch (error) {
-    return { ok: false, detail: `启动失败：${error.message || error}` }
-  }
+/* -------------------------------------------------------------- public heal */
+
+export async function enableAccess(config, steps = []) {
+  return switchOn(config, steps)
 }
 
-async function waitForController(config, secret, timeoutMs) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const version = await controllerCall(config, secret, { path: '/version' })
-    if (version.ok) return true
-    await sleep(700)
-  }
-  return false
+export async function disableAccess(config, steps = []) {
+  return switchOff(config, steps)
 }
-
-export async function ensureTun(config, secret) {
-  const before = await controllerCall(config, secret, { path: '/configs' })
-  if (!before.ok) {
-    return { ok: false, changed: false, detail: `控制器不可用：${before.error || before.status}` }
-  }
-  const tun = before.json && typeof before.json.tun === 'object' && before.json.tun ? before.json.tun : null
-  if (tun && tun.enable === true) {
-    return { ok: true, changed: false, detail: 'TUN 已处于开启状态' }
-  }
-  const patched = await controllerCall(config, secret, {
-    method: 'PATCH',
-    path: '/configs',
-    body: { tun: { ...(tun || {}), enable: true } },
-  })
-  const after = await controllerCall(config, secret, { path: '/configs' })
-  const enabled = Boolean(after.ok && after.json && after.json.tun && after.json.tun.enable === true)
-  return {
-    ok: enabled,
-    changed: true,
-    detail: enabled
-      ? 'TUN 已开启'
-      : `TUN 开启失败（HTTP ${patched.status || patched.error || 'unknown'}）`,
-  }
-}
-
-function runPowerShell(script, timeoutMs = 15000) {
-  const shell = process.env.SystemRoot
-    ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-    : 'powershell.exe'
-  return new Promise((resolve) => {
-    const child = spawn(
-      shell,
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-      { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
-    )
-    let stdout = ''
-    let stderr = ''
-    child.stdout.on('data', (chunk) => {
-      stdout += String(chunk)
-    })
-    child.stderr.on('data', (chunk) => {
-      stderr += String(chunk)
-    })
-    const timer = setTimeout(() => {
-      try {
-        child.kill()
-      } catch {
-        /* already gone */
-      }
-    }, timeoutMs)
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() })
-    })
-    child.on('error', (error) => {
-      clearTimeout(timer)
-      resolve({ code: -1, stdout: '', stderr: error.message || String(error) })
-    })
-  })
-}
-
-export async function ensureSystemProxy(config, enable = true) {
-  const server = [config.proxyPort]
-    .map((port) => `http=127.0.0.1:${port};https=127.0.0.1:${port};socks=127.0.0.1:${port}`)
-    .join('')
-  const script = `
-$ErrorActionPreference = 'Stop'
-$key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
-$current = Get-ItemProperty -Path $key
-Set-ItemProperty -Path $key -Name ProxyEnable -Value ${enable ? 1 : 0} -Type DWord
-Set-ItemProperty -Path $key -Name ProxyServer -Value '${server}' -Type String
-Add-Type -Namespace NinjaSelfHeal -Name WinINet -MemberDefinition '[DllImport("wininet.dll", SetLastError=true)] public static extern bool InternetSetOption(IntPtr h, int option, IntPtr buffer, int length);'
-[NinjaSelfHeal.WinINet]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
-[NinjaSelfHeal.WinINet]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
-$after = Get-ItemProperty -Path $key
-Write-Output ('[state]' + (ConvertTo-Json -Compress -InputObject @{ before = @{ enable = $current.ProxyEnable; server = $current.ProxyServer }; after = @{ enable = $after.ProxyEnable; server = $after.ProxyServer } }))
-`.trim()
-
-  const result = await runPowerShell(script)
-  if (result.code !== 0) {
-    return { ok: false, changed: false, detail: `设置系统代理失败：${result.stderr || 'powershell error'}` }
-  }
-  const line = result.stdout.split(/\r?\n/).find((entry) => entry.startsWith('[state]'))
-  let state = null
-  if (line) {
-    try {
-      state = JSON.parse(line.slice('[state]'.length))
-    } catch {
-      state = null
-    }
-  }
-  const applied = Boolean(state && state.after && Number(state.after.enable) === 1)
-  const already = Boolean(state && state.before && Number(state.before.enable) === 1 && state.before.server === server)
-  return {
-    ok: applied,
-    changed: applied && !already,
-    detail: applied ? (already ? '系统代理已是开启状态' : '系统代理已开启') : '系统代理写入后校验失败',
-    state,
-  }
-}
-
-/** Keep the application's own saved settings consistent across restarts. */
-export function persistAppConfig(config) {
-  const file = path.join(config.dataDir, 'appconfig.yaml')
-  try {
-    const before = fs.readFileSync(file, 'utf8')
-    const after = before
-      .replace(/^(\s*system_proxy\s*:).*$/m, '$1 true')
-      .replace(/^(\s*tun_mode\s*:).*$/m, '$1 true')
-    if (after !== before) {
-      fs.writeFileSync(file, after, 'utf8')
-      return { ok: true, changed: true, detail: 'appconfig.yaml 已记录 system_proxy/tun_mode = true' }
-    }
-    return { ok: true, changed: false, detail: 'appconfig.yaml 无需修改' }
-  } catch (error) {
-    return { ok: false, changed: false, detail: `写入 appconfig.yaml 失败：${error.message || error}` }
-  }
-}
-
-/* ---------------------------------------------------------------- healing  */
 
 function brief(probe) {
-  return {
-    ok: probe.ok,
-    status: probe.status || 0,
-    ...(probe.error ? { error: probe.error } : {}),
-    ms: probe.ms || 0,
-  }
-}
-
-function summarize(report) {
-  const { target, needed, healed, probes, steps } = report
-  const lines = []
-  if (!needed) {
-    lines.push(`外网可访问，无需修复：${target}（直连 ${probes.direct.ok ? '正常' : '失败'}，代理 ${probes.proxy.ok ? '正常' : '失败'}）`)
-    return lines.join('')
-  }
-  lines.push(healed ? `已修复外网访问：${target}` : `修复未能恢复访问：${target}`)
-  const failed = steps.filter((step) => step && step.ok === false)
-  if (failed.length > 0) lines.push(`未完成的步骤：${failed.map((step) => step.detail).join('；')}`)
-  else lines.push(`直连：${probes.direct.ok ? '正常' : probes.direct.error || '失败'}；代理：${probes.proxy.ok ? '正常' : probes.proxy.error || '失败'}`)
-  return lines.join('。')
+  return { ok: probe.ok, status: probe.status || 0, ...(probe.error ? { error: probe.error } : {}), ms: probe.ms || 0 }
 }
 
 /**
- * Probe, repair, re-probe.
- * @param {object} config plugin config
- * @param {{url?: string}} options
+ * Probe, switch access on, re-probe. Used by the net_self_heal tool and by the
+ * automatic repair after a failed web call.
  */
 export async function heal(config, options = {}) {
   const cfg = resolveConfig(config)
@@ -430,90 +467,39 @@ export async function heal(config, options = {}) {
   steps.push({ step: 'probe', ok: direct.ok || proxy.ok, detail: `直连 ${direct.ok ? 'OK' : direct.error || direct.status}；代理 ${proxy.ok ? 'OK' : proxy.error || proxy.status}` })
 
   if (direct.ok || proxy.ok) {
-    const report = {
-      healed: false,
-      needed: false,
-      target,
-      probes: { direct: brief(direct), proxy: brief(proxy) },
-      steps,
-      elapsedMs: Date.now() - startedAt,
-    }
-    report.summary = summarize(report)
+    const report = { healed: true, needed: false, target, probes: { direct: brief(direct), proxy: brief(proxy) }, steps, elapsedMs: Date.now() - startedAt }
+    report.summary = `外网可访问，无需修复：${target}`
     return report
   }
 
-  if (!fs.existsSync(cfg.exePath) && !fs.existsSync(path.join(cfg.dataDir, 'kernel_session.json'))) {
-    const report = {
-      healed: false,
-      needed: true,
-      target,
-      probes: { direct: brief(direct), proxy: brief(proxy) },
-      steps: [...steps, { step: 'locate', ok: false, detail: `未找到 NinjaDesktop（${cfg.exePath}），请在插件配置里设置 exePath/dataDir` }],
-      elapsedMs: Date.now() - startedAt,
-    }
-    report.summary = summarize(report)
-    return report
-  }
-
-  let { secret } = readController(cfg.dataDir)
-  let controller = await controllerCall(cfg, secret, { path: '/version' })
-
-  if (!controller.ok) {
-    const running = await isAppRunning()
-    if (running) {
-      steps.push({ step: 'app', ok: true, detail: 'NinjaDesktop 已在运行，等待内核就绪' })
-    } else {
-      const launched = launchApp(cfg.exePath)
-      steps.push({ step: 'launch', ok: launched.ok, detail: launched.detail })
-    }
-    const ready = await waitForController(cfg, secret, cfg.launchTimeoutMs)
-    steps.push({ step: 'controller', ok: ready, detail: ready ? '内核控制器已就绪' : '等待内核控制器超时' })
-    ;({ secret } = readController(cfg.dataDir))
-    controller = await controllerCall(cfg, secret, { path: '/version' })
-  } else {
-    steps.push({ step: 'app', ok: true, detail: 'NinjaDesktop 内核已在运行' })
-  }
-
-  if (controller.ok) {
-    const profile = await controllerCall(cfg, secret, { path: '/configs' })
-    if (profile.ok && profile.json && profile.json['mixed-port']) {
-      cfg.proxyPort = Number(profile.json['mixed-port']) || cfg.proxyPort
-    }
-    const tun = await ensureTun(cfg, secret)
-    steps.push({ step: 'tun', ok: tun.ok, detail: tun.detail })
-
-    const proxyStep = await ensureSystemProxy(cfg, true)
-    steps.push({ step: 'system-proxy', ok: proxyStep.ok, detail: proxyStep.detail })
-
-    const persisted = persistAppConfig(cfg)
-    steps.push({ step: 'persist', ok: persisted.ok, detail: persisted.detail })
-  } else {
-    steps.push({ step: 'controller', ok: false, detail: '内核控制器仍不可用，无法开启 TUN' })
-  }
-
-  await sleep(1200)
+  const switched = await switchOn(cfg, steps)
+  await sleep(1000)
   const directAfter = await probeDirect(target, cfg.probeTimeoutMs)
   const proxyAfter = await probeViaProxy(target, cfg.proxyPort, cfg.probeTimeoutMs)
   steps.push({ step: 'retry', ok: directAfter.ok || proxyAfter.ok, detail: `重试：直连 ${directAfter.ok ? 'OK' : directAfter.error || directAfter.status}；代理 ${proxyAfter.ok ? 'OK' : proxyAfter.error || proxyAfter.status}` })
 
+  const healed = directAfter.ok || proxyAfter.ok
   const report = {
-    healed: directAfter.ok || proxyAfter.ok,
+    healed,
     needed: true,
     target,
-    controller: { port: cfg.controllerPort, reachable: controller.ok },
+    switched: switched.ok,
     probes: { direct: brief(directAfter), proxy: brief(proxyAfter) },
     steps,
     elapsedMs: Date.now() - startedAt,
   }
-  report.summary = summarize(report)
+  report.summary = healed
+    ? `已恢复外网访问：${target}（代理与 TUN 已开启，离开网页后会自动关闭）`
+    : `修复未能恢复访问：${target}；${steps.filter((step) => step.ok === false).map((step) => step.detail).join('；') || '原因未知'}`
   return report
 }
 
 /* ------------------------------------------------------------ plugin entry */
 
 const PROMPT_TEXT = [
-  '网络自愈规则：当访问外部网站（例如 github.com）失败时，先调用 net_self_heal 工具并传入失败的 URL；',
-  '该工具会启动 NinjaDesktop、开启其系统代理与 TUN，然后重试该地址。',
+  '网络规则：访问网页前，插件会自动开启 NinjaDesktop 的系统代理与 TUN，网页访问结束后自动关闭；',
+  '这是正常现象，不要为此提示用户或手动改设置。',
+  '如果网页仍然失败，调用 net_self_heal 并传入失败的 URL 做一次修复；',
   '只有在 net_self_heal 返回 healed: false 之后，才改用其他办法（检查 DNS、换镜像源、换备用站点等），',
   '并如实说明哪一步失败，不要假装访问成功。',
 ].join('')
@@ -521,89 +507,169 @@ const PROMPT_TEXT = [
 export async function apply(ctx, config) {
   const cfg = resolveConfig(config)
 
-  ctx.effect(() =>
-    ctx.tools.register(
-      {
-        name: 'net_self_heal',
-        description:
-          'Repair broken access to an external website. Probes the URL directly and through the local proxy, starts NinjaDesktop when its kernel is down, enables the application\'s system proxy and TUN mode, then re-probes the same URL. Use this when a web request fails (for example github.com) before trying other workarounds.',
-        parameters: {
-          type: 'object',
-          properties: {
-            url: {
-              type: 'string',
-              description: 'Absolute http(s) URL to test and repair access for. Defaults to the plugin probeUrl (https://github.com).',
-            },
-          },
-          additionalProperties: false,
-        },
-        output: {
-          schema: {
-            type: 'object',
-            properties: {
-              healed: { type: 'boolean', description: 'Whether the target became reachable.' },
-              needed: { type: 'boolean', description: 'Whether a repair was attempted.' },
-              target: { type: 'string' },
-              summary: { type: 'string' },
-            },
-            required: ['healed', 'needed', 'target', 'summary'],
-            additionalProperties: true,
-          },
-          render: (_args, value) => {
-            const text = value && typeof value.summary === 'string' ? value.summary : '网络自愈已执行'
-            return [{ type: 'text', text }]
-          },
-        },
-        presentCall: (args) => ({
-          card: 'generic',
-          title: 'Repairing network access',
-          kind: 'execute',
-          rawInput: args,
-        }),
-        timeoutMs: 120000,
-        isConcurrencySafe: () => false,
-        execute: async (args) => {
-          const url = args && typeof args.url === 'string' && args.url.trim() ? args.url.trim() : cfg.probeUrl
-          return heal(cfg, { url })
-        },
-      },
-      { when: () => process.platform === 'win32' },
-    ),
-  )
+  // Lease state: web tools hold a lease while they run; when the last lease is
+  // released the switches are turned back off after idleGraceMs.
+  const state = { count: 0, timer: null, switching: null, on: false, baseline: null, lastReport: null }
+  const log = (message) => ctx.logger?.info?.(`${PLUGIN_ID}: ${message}`)
+
+  const runExclusive = async (fn) => {
+    while (state.switching) await state.switching.catch(() => {})
+    const current = fn().finally(() => {
+      state.switching = null
+    })
+    state.switching = current
+    return current
+  }
+
+  const turnOn = async () => {
+    if (state.on) return { ok: true, steps: [{ step: 'cached', ok: true, detail: '代理与 TUN 已开启' }] }
+    const steps = []
+    const result = await runExclusive(async () => {
+      if (!state.baseline) state.baseline = await snapshot(cfg)
+      return switchOn(cfg, steps)
+    })
+    state.on = result.ok
+    state.lastReport = result
+    if (!result.ok) log(`启用失败: ${steps.map((step) => step.detail).join(' | ')}`)
+    return result
+  }
+
+  const turnOff = async () => {
+    if (!state.on) {
+      state.baseline = null
+      return { ok: true, steps: [{ step: 'cached', ok: true, detail: '代理与 TUN 本来就关着' }] }
+    }
+    const steps = []
+    const baseline = state.baseline
+    const target = cfg.releaseMode === 'restore' && baseline && baseline.available ? baseline : null
+    const restoreTo = Boolean(target && (target.proxy || target.tun))
+    const result = await runExclusive(async () => {
+      if (restoreTo) return switchOn(cfg, steps)
+      return switchOff(cfg, steps)
+    })
+    if (result.ok) state.on = restoreTo
+    state.baseline = null
+    state.lastReport = result
+    log(`已关闭代理与 TUN: ${result.ok}`)
+    return result
+  }
+
+  const scheduleRelease = () => {
+    if (state.timer) clearTimeout(state.timer)
+    state.timer = setTimeout(() => {
+      state.timer = null
+      if (state.count === 0) void turnOff().catch(() => {})
+    }, cfg.idleGraceMs)
+  }
+
+  const acquire = async () => {
+    state.count += 1
+    if (state.timer) {
+      clearTimeout(state.timer)
+      state.timer = null
+    }
+    return turnOn()
+  }
+
+  const release = () => {
+    state.count = Math.max(0, state.count - 1)
+    if (state.count === 0) scheduleRelease()
+  }
+
+  // 1) Before a web tool: turn the switches on.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (!cfg.manageOnWebAccess || !WEB_TOOLS.has(exec?.name)) return next()
+    try {
+      const lease = await acquire()
+      if (!lease.ok && lease.steps) log(`web 前启用未完全成功: ${lease.steps.map((step) => step.detail).join(' | ')}`)
+    } catch (error) {
+      log(`web 前启用异常: ${error.message || error}`)
+    }
+    return next()
+  })
+
+  // 2) After a web tool: release the lease (the idle timer turns things off).
+  ctx.on('tools/result', (exec, result) => {
+    if (!cfg.manageOnWebAccess || !WEB_TOOLS.has(exec?.name)) return
+    release()
+    if (cfg.autoHeal && result && result.isError) {
+      const args = exec?.arguments
+      const url = args && typeof args === 'object' && typeof args.url === 'string' ? args.url : cfg.probeUrl
+      void heal(cfg, { url }).catch(() => {})
+    }
+  })
+
+  // 3) End of a turn: no browsing is coming, so close immediately. Resetting
+  // the counter also recovers from a lease whose tool call never settled.
+  ctx.on('turn/end', () => {
+    if (!cfg.manageOnWebAccess) return
+    state.count = 0
+    if (state.timer) {
+      clearTimeout(state.timer)
+      state.timer = null
+    }
+    void turnOff().catch(() => {})
+  })
 
   ctx.effect(() =>
-    ctx.systemPrompt.section({
-      name: PLUGIN_ID,
-      order: 55,
-      text: PROMPT_TEXT,
+    ctx.tools.register({
+      name: 'net_self_heal',
+      description:
+        'Repair broken access to an external website. Turns the NinjaDesktop system proxy and TUN on, probes the URL directly and through the local proxy, and reports every step. Use it when a web request fails (for example github.com) before trying other workarounds.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: 'Absolute http(s) URL to test and repair access for. Defaults to the plugin probeUrl.',
+          },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            healed: { type: 'boolean', description: 'Whether the target is reachable now.' },
+            needed: { type: 'boolean', description: 'Whether a repair was attempted.' },
+            target: { type: 'string' },
+            summary: { type: 'string' },
+          },
+          required: ['healed', 'needed', 'target', 'summary'],
+          additionalProperties: true,
+        },
+        render: (_args, value) => {
+          const text = value && typeof value.summary === 'string' ? value.summary : '网络自愈已执行'
+          return [{ type: 'text', text }]
+        },
+      },
+      presentCall: (args) => ({ card: 'generic', title: 'Repairing network access', kind: 'execute', rawInput: args }),
+      timeoutMs: 180000,
+      isConcurrencySafe: () => false,
+      execute: async (args) => {
+        const url = args && typeof args.url === 'string' && args.url.trim() ? args.url.trim() : cfg.probeUrl
+        const report = await heal(cfg, { url })
+        // heal() switched access on outside a lease; hold one so the idle
+        // timer turns it back off instead of leaving it on forever.
+        if (report.needed) {
+          state.on = true
+          state.count += 1
+          release()
+        }
+        return report
+      },
     }),
   )
 
-  // Automatic repair after a failed web tool call. Silent by design: it only
-  // restores connectivity so the model's own retry can succeed.
-  let lastRunAt = 0
-  let inFlight = null
-  ctx.on('tools/result', (exec, result) => {
-    if (!cfg.autoHeal) return
-    if (!result || !result.isError) return
-    const name = exec && exec.name
-    if (!WEB_TOOLS.has(name)) return
-    if (inFlight) return
-    if (Date.now() - lastRunAt < cfg.healCooldownMs) return
-    lastRunAt = Date.now()
-    let url = cfg.probeUrl
-    const args = exec && exec.arguments
-    if (args && typeof args === 'object' && typeof args.url === 'string' && /^https?:\/\//i.test(args.url)) {
-      url = args.url
-    }
-    inFlight = heal(cfg, { url })
-      .catch(() => undefined)
-      .finally(() => {
-        inFlight = null
-      })
+  ctx.effect(() =>
+    ctx.systemPrompt.section({ name: PLUGIN_ID, order: 55, text: PROMPT_TEXT }),
+  )
+
+  ctx.effect(() => () => {
+    if (state.timer) clearTimeout(state.timer)
   })
 
-  ctx.logger?.info?.(`${PLUGIN_ID} ready (controller ${cfg.controllerPort}, proxy ${cfg.proxyPort})`)
+  log(`ready (backend ${cfg.appBaseUrl}, grace ${cfg.idleGraceMs}ms, release ${cfg.releaseMode})`)
 }
 
 export { DEFAULT_CONFIG }

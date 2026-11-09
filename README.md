@@ -1,48 +1,46 @@
 # dsh-ninja-net-heal
 
-DeepSeek Harness（DSH）插件：**外网访问失败时自动修复**。
+DeepSeek Harness（DSH）插件：**访问网页时自动开代理/TUN，访问结束自动关掉**。
 
-规则很简单——当访问外网站点（如 `github.com`）失败时，先启动 `NinjaDesktop`、开启它的**系统代理**与 **TUN**，然后重试原地址；只有在修复仍然失败时，才去尝试别的办法。
+规则：需要访问外部网站时，自动开启 `NinjaDesktop` 的**系统代理**与 **TUN**；网页访问结束后自动关闭，避免代理长期常驻。如果网页仍然失败，`net_self_heal` 会做一次修复并把每一步的真实结果报出来。
 
-插件把这个规则做成了三件事：
+## 行为
 
-| 组成 | 作用 |
+| 时机 | 动作 |
 | --- | --- |
-| `net_self_heal` 工具 | 模型可主动调用：探测 URL → 拉起程序 → 开代理/TUN → 重试，并返回每一步的真实结果 |
-| 系统提示词片段 | 告诉模型「网页失败时先调 `net_self_heal`，不要直接放弃」 |
-| 失败自动修复 | 监听 `tools/result`，`web_fetch` / `web_search` 等工具报错时在后台静默修复（带冷却，避免反复重启） |
+| web 工具执行前（`web_fetch` / `web_search` / `read_page`） | 开启系统代理 + TUN，然后才真正发起请求 |
+| 最后一次 web 调用结束 + 空闲 `idleGraceMs` | 关闭系统代理 + TUN |
+| 回合结束（`turn/end`） | 立即关闭，并清理可能残留的租约 |
+| web 调用失败 | 后台 `net_self_heal` 再修一次 |
 
-## 工作原理
+连续多个 web 调用不会反复开关：用**租约计数**合并，只有全部结束后才关。关闭默认是「强制关闭」（`releaseMode: disable`），也可设为 `restore`，在访问前本来就是开的情况下保持开启。
 
-NinjaDesktop 内置 **mihomo** 内核，因此不需要模拟鼠标去点界面：
+## 关键修复：系统代理「打不开」
 
-- **TUN** —— 通过内核外部控制器 `PATCH /configs {"tun":{"enable":true}}` 开启（默认 `127.0.0.1:9799`，密钥读自 `kernel_session.json`）。
-- **系统代理** —— 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的 `ProxyEnable` / `ProxyServer`，再调用 WinINet `InternetSetOption` 让设置立即生效；同时把 `appconfig.yaml` 里的 `system_proxy` / `tun_mode` 置为 `true`，保证程序下次启动仍保持开启。
-- **进程** —— 内核不可达时先看 `NinjaDesktop.exe` 是否在跑；没跑才用 `exePath` 启动并等待控制器就绪。
+v1 直接写注册表 `ProxyEnable`、直接改内核 `tun`，但 **NinjaDesktop 自己持有这两个开关的状态并会回写**，所以看起来「刚打开又自己关了」。
 
-探测同时走两条路：**直连**（Node 原生，不经过系统代理）和**经本地代理**（`CONNECT` 隧道 + TLS）。两者都失败才判定为「外网不通」，避免误修复。
+v2 改走程序自己的接口，这些才是权威入口：
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /api/sysproxy/enable` / `disable` | 真正开关系统代理（由服务提权写 WinINet，立即生效） |
+| `GET /api/sysproxy/status` | 读真实状态 |
+| `PUT /api/config` `{system_proxy, tun_mode}` | 开 / 关 TUN（会同步内核与 `appconfig.yaml`） |
+| `GET 127.0.0.1:9799/configs` | 校验内核 TUN 是否真的开了 |
+
+每次切换后都会**轮询校验三处状态**（应用、注册表、内核）；若应用接口报成功但注册表仍是关的，自动降级为直接写注册表 + `InternetSetOption` 刷新，再校验一次。写入 `/api/config` 采用「读出完整配置 → 合并两个字段 → 写回」，不会覆盖你的其他设置。
 
 ## 安装
 
-在 DSH 中把本目录作为本地 bundle 安装：
-
 ```powershell
-# 在任意会话中让 DSH 执行：
-#   plugin_manager action=install_bundle target=<本目录绝对路径>
+# 让 DSH 执行：plugin_manager action=install_bundle target=<本目录绝对路径>
 ```
 
-或手动：
+安装后：**设置 → 插件** 中出现该插件；工具 `net_self_heal` 可用。
 
-```powershell
-cd C:\Users\<you>\dsh_work1\dsh-ninja-net-heal
-# 然后调用 plugin_manager install_bundle，target 为上行的绝对路径
-```
-
-安装后插件行出现在 **设置 → 插件** 中，工具 `net_self_heal` 立即可用。
+> 注意：`install_bundle` 是链接安装，profile 指向本目录，**移动或删除目录会导致插件失效**。
 
 ## 配置
-
-在 profile 的 `cordis.patch.yml` 中修改本插件行的 `config`（未声明的字段使用内置默认值）：
 
 ```yaml
 - insert:
@@ -50,69 +48,70 @@ cd C:\Users\<you>\dsh_work1\dsh-ninja-net-heal
       name: dsh-ninja-net-heal
       config:
         exePath: C:\Program Files\NinjaDesktop\NinjaDesktop.exe
-        dataDir: C:\Users\<you>\AppData\Local\NinjaDesktop
+        appBaseUrl: http://127.0.0.1:9190
         controllerPort: 9799
         proxyPort: 7897
+        manageOnWebAccess: true
+        idleGraceMs: 15000
+        releaseMode: disable
         probeUrl: https://github.com
-        probeTimeoutMs: 8000
-        launchTimeoutMs: 45000
         autoHeal: true
-        healCooldownMs: 60000
 ```
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `exePath` | `C:\Program Files\NinjaDesktop\NinjaDesktop.exe` | 程序路径，内核未运行时用于启动 |
-| `dataDir` | `%LOCALAPPDATA%\NinjaDesktop` | 存放 `kernel_session.json` / `appconfig.yaml` 的目录 |
-| `controllerPort` | `9799` | mihomo 外部控制器端口 |
-| `proxyPort` | `7897` | 混合代理端口（写入系统代理、用于代理探测） |
-| `probeUrl` | `https://github.com` | 未指定 URL 时的探测目标 |
-| `probeTimeoutMs` | `8000` | 单次探测超时 |
-| `launchTimeoutMs` | `45000` | 启动后等待控制器就绪的上限 |
-| `autoHeal` | `true` | web 工具失败后是否自动修复 |
-| `healCooldownMs` | `60000` | 两次自动修复的最小间隔 |
+| `exePath` | `C:\Program Files\NinjaDesktop\NinjaDesktop.exe` | 后端不可达时用于启动程序 |
+| `appBaseUrl` | `http://127.0.0.1:9190` | 程序后端地址（系统代理接口所在） |
+| `controllerPort` | `9799` | mihomo 控制器，用于校验 TUN |
+| `proxyPort` | `7897` | 混合代理端口 |
+| `manageOnWebAccess` | `true` | 总开关：是否在网页访问前后自动开关 |
+| `idleGraceMs` | `15000` | 最后一次 web 调用后多久关闭 |
+| `releaseMode` | `disable` | `disable` 结束即关；`restore` 恢复到访问前状态 |
+| `probeUrl` | `https://github.com` | 默认探测目标 |
+| `autoHeal` | `true` | web 调用失败后是否后台修复 |
+| `launchTimeoutMs` | `45000` | 启动后等待后端就绪 |
+| `verifyAttempts` / `verifyDelayMs` | `8` / `500` | 切换后的校验轮询 |
 
-## 工具返回值
+## 工具
+
+`net_self_heal({ url })` 返回：
 
 ```jsonc
 {
-  "healed": true,            // 最终是否恢复访问
-  "needed": true,            // 是否触发了修复
-  "target": "https://github.com",
-  "controller": { "port": 9799, "reachable": true },
-  "probes": { "direct": { "ok": true, "status": 200 }, "proxy": { "ok": true, "status": 200 } },
+  "healed": false,
+  "needed": true,
+  "target": "https://dsh-net-heal-probe.invalid",
+  "switched": true,
+  "probes": { "direct": { "ok": false, "error": "ECONNRESET" }, "proxy": { "ok": false, "error": "ECONNRESET" } },
   "steps": [
-    { "step": "probe",        "ok": false, "detail": "直连 ECONNRESET；代理 ECONNRESET" },
-    { "step": "app",          "ok": true,  "detail": "NinjaDesktop 内核已在运行" },
-    { "step": "tun",          "ok": true,  "detail": "TUN 已开启" },
-    { "step": "system-proxy", "ok": true,  "detail": "系统代理已开启" },
-    { "step": "persist",      "ok": true,  "detail": "appconfig.yaml 已记录 system_proxy/tun_mode = true" },
-    { "step": "retry",        "ok": true,  "detail": "重试：直连 OK；代理 OK" }
+    { "step": "probe",    "ok": false, "detail": "直连 ENOTFOUND；代理 ECONNRESET" },
+    { "step": "config",   "ok": true,  "detail": "tun_mode/system_proxy = true" },
+    { "step": "sysproxy", "ok": true,  "detail": "已请求开启系统代理" },
+    { "step": "verify-on","ok": true,  "detail": "proxy=true tun=true" },
+    { "step": "retry",    "ok": false, "detail": "重试：直连 ECONNRESET；代理 ECONNRESET" }
   ],
-  "elapsedMs": 3176,
-  "summary": "已修复外网访问：https://github.com"
+  "elapsedMs": 4210,
+  "summary": "修复未能恢复访问：…"
 }
 ```
 
-`healed: false` 时 `steps` 会指出到底哪一步失败，不会谎报成功。
+`healed: false` 时 `steps` 明确指出哪一步失败，不会谎报成功。
 
 ## 测试
 
-两个脚本都不依赖 DSH，直接用 Node 跑：
-
 ```powershell
-node test/smoke.mjs          # 健康目标不修复 / 故障目标走完整修复链路
-node test/repair-paths.mjs   # 先关掉 TUN 与系统代理，验证 ensure* 真的能拨回开启
+node test/lifecycle.mjs
 ```
 
-`repair-paths.mjs` 会在结束时让 TUN 与系统代理保持开启。
+覆盖：干净状态 → 开启（三处都真开）→ 5 秒稳定性 → 关闭（三处都真关）→ 可达目标不误修 → 不可达目标走完整修复链路 → 回到关闭。结束时保持关闭。
 
 ## 限制
 
-- 仅 Windows：依赖注册表、WinINet、`tasklist`、PowerShell 5.1。
-- 只处理「程序已在/可启动 + 内核可控」的情况；节点全部失效、订阅过期、内核崩溃需要用户自己在 NinjaDesktop 里处理。
-- 若 NinjaDesktop 的内核控制器关闭或改了端口，需同步修改 `controllerPort`。
-- 自动修复是**静默**的：它恢复连通性，但不会替模型重发请求，重试仍由模型完成。
+- 仅 Windows：依赖程序后端、注册表、WinINet、`tasklist`、PowerShell 5.1。
+- 程序必须能提供 `9190` 后端；内核被手动停掉时需要先启动程序。
+- 频繁开关 TUN 有约 1–3 秒建立时间，所以用 `idleGraceMs` 合并连续访问；把该值调大可以减少抖动，代价是代理多留一会儿。
+- `releaseMode: disable` 会关掉你手动开的代理/TUN；不想被关就用 `restore`。
+- 节点失效、订阅过期等需要你在 NinjaDesktop 里处理，插件不替你换节点。
 
 ## 许可证
 

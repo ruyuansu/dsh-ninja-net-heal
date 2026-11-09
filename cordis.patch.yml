@@ -6,10 +6,11 @@
       name: dsh-ninja-net-heal
       config:
         exePath: C:\Program Files\NinjaDesktop\NinjaDesktop.exe
+        appBaseUrl: http://127.0.0.1:9190
         controllerPort: 9799
         proxyPort: 7897
+        manageOnWebAccess: true
+        idleGraceMs: 15000
+        releaseMode: disable
         probeUrl: https://github.com
-        probeTimeoutMs: 8000
-        launchTimeoutMs: 45000
         autoHeal: true
-        healCooldownMs: 60000
