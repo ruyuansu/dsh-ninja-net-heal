@@ -6,6 +6,11 @@
   "description": "Turns the NinjaDesktop system proxy and TUN on before web access and off after it, and repairs broken access on demand.",
   "keywords": ["dsh", "dsh-plugin", "cordis", "network", "proxy", "tun", "ninja-desktop"],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruyuansu/dsh-ninja-net-heal.git"
+  },
+  "homepage": "https://github.com/ruyuansu/dsh-ninja-net-heal#readme",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",

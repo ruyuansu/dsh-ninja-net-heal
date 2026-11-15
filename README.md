@@ -32,13 +32,26 @@ v2 改走程序自己的接口，这些才是权威入口：
 
 ## 安装
 
+### 一行安装（推荐，从 GitHub 直接装）
+
+在 DSH 里说一句：
+
+```
+用 plugin_manager 安装插件：action=install_bundle target=github:ruyuansu/dsh-ninja-net-heal
+```
+
+等价于让 DSH 执行 `pnpm add github:ruyuansu/dsh-ninja-net-heal`；装完会自动把插件行写进 profile 的 `cordis.patch.yml`。
+需要本机有 `git` 和网络（能访问 GitHub）。升级也是重新执行一次这条命令。
+
+### 本地目录安装（离线/自定义）
+
 ```powershell
 # 让 DSH 执行：plugin_manager action=install_bundle target=<本目录绝对路径>
 ```
 
 安装后：**设置 → 插件** 中出现该插件；工具 `net_self_heal` 可用。
 
-> 注意：`install_bundle` 是链接安装，profile 指向本目录，**移动或删除目录会导致插件失效**。
+> 注意：本地目录安装是**链接安装**，profile 指向该目录，**移动或删除目录会导致插件失效**；从 GitHub 安装则会落到 DSH 的 profile 依赖里，不受此限。
 
 ## 配置
 
